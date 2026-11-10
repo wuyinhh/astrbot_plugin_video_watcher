@@ -170,6 +170,11 @@ class VideoWatcher(Star):
                     logger.warning(f"[video_watcher] B 站下载失败: {err[-1000:]}")
                     if "缺少下载依赖" in err:
                         return "缺少视频下载依赖，请在 AstrBot 插件页重新更新视频观察员，并检查依赖安装日志。"
+                    if re.search(r"timed?\s*out|timeout", err, re.IGNORECASE):
+                        return (
+                            "连接 B 站或视频下载节点时发生连接超时，视频未下载成功。"
+                            "本次尚未抽帧或观看，请稍后重试，或直接发送视频文件。"
+                        )
                     status = re.search(r"HTTP Error (\d{3})", err)
                     if status:
                         return (

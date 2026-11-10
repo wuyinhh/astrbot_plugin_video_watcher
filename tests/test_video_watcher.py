@@ -134,6 +134,10 @@ class LinkTests(unittest.TestCase):
         class FakeDownloader:
             def __init__(self, options):
                 self.hook = options["progress_hooks"][0]
+                self.params = {"outtmpl": {"default": options["outtmpl"]}}
+
+            def add_info_extractor(self, ie):
+                pass
 
             def __enter__(self):
                 return self
@@ -141,23 +145,45 @@ class LinkTests(unittest.TestCase):
             def __exit__(self, *args):
                 return False
 
-            def extract_info(self, url, download):
+            def extract_info(self, url, download, process):
+                return {"formats": [{"url": "https://example.com/video.mp4"}]}
+
+            def process_ie_result(self, info, download):
+                return info["formats"][0]
+
+            def process_info(self, info):
                 self.hook({"downloaded_bytes": 1024 * 1024 + 1})
 
-        with patch.dict(sys.modules, {"yt_dlp": types.SimpleNamespace(YoutubeDL=FakeDownloader)}):
+        with patch.dict(sys.modules, {
+            "yt_dlp": types.SimpleNamespace(YoutubeDL=FakeDownloader),
+            "yt_dlp.utils": types.SimpleNamespace(DownloadError=RuntimeError),
+        }), patch.object(bili, "_bilibili_extractor", return_value=Mock()):
             with self.assertRaisesRegex(ValueError, "超过 1 MB"):
                 bili.download_video(URL, ROOT, 1)
 
 
 class DownloadRegressionTests(unittest.TestCase):
     def test_server_requiring_range_downloads_complete_file(self):
+        self._download_from_test_server()
+
+    def test_full_download_failure_switches_node_and_does_not_reuse_partial_file(self):
+        self._download_from_test_server(fail_first=True)
+
+    def test_all_nodes_fail_after_three_attempts_and_partial_files_are_removed(self):
+        self._download_from_test_server(fail_first=True, fail_all=True)
+
+    def _download_from_test_server(self, fail_first=False, fail_all=False):
         try:
             from yt_dlp import YoutubeDL
+            from yt_dlp.utils import DownloadError
         except ImportError:
             self.skipTest("需要安装 yt-dlp 才能测试真实 HTTP 下载器")
 
         payload = b"range-only-video" * 400000
         requests = []
+        failed_requests = []
+        backup_partial_files = []
+        output_dir = None
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -172,6 +198,12 @@ class DownloadRegressionTests(unittest.TestCase):
                 start, end = value.removeprefix("bytes=").split("-", 1)
                 start = int(start)
                 end = min(int(end) if end else len(payload) - 1, len(payload) - 1)
+                # 试读可用，正式下载中途断开，复现小范围探测无法识别的坏节点。
+                broken = (self.path.startswith("/bad") or fail_all) and end - start > 10240
+                if broken:
+                    failed_requests.append(value)
+                if self.path == "/video.mp4" and failed_requests:
+                    backup_partial_files.extend(output_dir.glob("attempt_0_*/*.part"))
                 if start >= len(payload):
                     self.send_response(416)
                     self.send_header("Content-Range", f"bytes */{len(payload)}")
@@ -182,17 +214,19 @@ class DownloadRegressionTests(unittest.TestCase):
                 self.send_header("Content-Length", str(end - start + 1))
                 self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
                 self.end_headers()
-                self.wfile.write(payload[start:end + 1])
+                self.wfile.write(b"bad-partial" if broken else payload[start:end + 1])
+                if broken:
+                    self.close_connection = True
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
-        def extract_info(downloader, url, download):
+        def extract_info(downloader, url, download, process):
             # 仅替换远程视频元数据解析；格式试读和正式下载均使用真实 yt-dlp。
             # 测试仅访问本机 HTTP 服务，不使用系统代理。
             downloader.params["proxy"] = ""
-            return downloader.process_ie_result({
+            info = {
                 "id": "range-test",
                 "title": "range-test",
                 "extractor": "test",
@@ -205,19 +239,71 @@ class DownloadRegressionTests(unittest.TestCase):
                     "vcodec": "avc1",
                     "acodec": "none",
                 }],
-            }, download=download)
+            }
+            if fail_first:
+                info["formats"].append({
+                    **info["formats"][0], "format_id": "bad",
+                    "url": f"http://127.0.0.1:{server.server_port}/bad.mp4",
+                    "height": 720,
+                })
+            if fail_all:
+                info["formats"].extend({
+                    **info["formats"][-1], "format_id": f"bad-{i}",
+                    "url": f"http://127.0.0.1:{server.server_port}/bad-{i}.mp4",
+                } for i in range(3))
+            return info
 
         try:
             with tempfile.TemporaryDirectory(prefix="vw_range_test_") as directory:
+                output_dir = Path(directory)
                 with patch.object(YoutubeDL, "extract_info", extract_info):
+                    if fail_all:
+                        with self.assertRaises(DownloadError):
+                            bili.download_video(URL, output_dir, 10)
+                        self.assertEqual(len(failed_requests), 3)
+                        self.assertEqual(list(output_dir.iterdir()), [])
+                        return
                     path = bili.download_video(URL, Path(directory), 10)
                 self.assertEqual(path.read_bytes(), payload)
                 self.assertGreater(len(requests), 2)
                 self.assertTrue(all(requests))
+                self.assertEqual(list(output_dir.iterdir()), [path])
+                if fail_first:
+                    self.assertTrue(failed_requests)
+                    self.assertFalse(backup_partial_files)
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_extractor_preserves_signed_backups_and_prefers_regular_cdn(self):
+        try:
+            from yt_dlp import YoutubeDL
+        except ImportError:
+            self.skipTest("需要安装 yt-dlp")
+        primary = "https://test.mcdn.bilivideo.cn:8082/video.m4s?signature=primary"
+        backup = "https://upos.example.com/video.m4s?signature=backup&deadline=123"
+        for base_key, backup_key in (("baseUrl", "backupUrl"), ("base_url", "backup_url")):
+            with self.subTest(base_key=base_key), YoutubeDL({"quiet": True, "check_formats": False,
+                    "format": "bestvideo/best", "format_sort": ["source"]}) as dl:
+                extractor = bili._bilibili_extractor()
+                dl.add_info_extractor(extractor)
+                formats = extractor.extract_formats({"dash": {"video": [{
+                    base_key: primary, backup_key: [backup, backup],
+                    "id": 80, "height": 720, "width": 1280, "codecs": "avc1",
+                    "mimeType": "video/mp4",
+                }], "audio": [{"baseUrl": "https://example.com/audio.m4s", "codecs": "mp4a"}]}})
+                video_formats = [f for f in formats if f.get("vcodec") != "none"]
+                self.assertEqual({f["url"] for f in video_formats}, {primary, backup})
+                selected = dl.process_ie_result({
+                    "id": "cdn-test", "title": "cdn-test", "extractor": "test", "formats": video_formats,
+                }, download=False)
+                self.assertEqual(selected["url"], backup)
+
+    def test_multi_fragment_flv_is_not_replaced_with_one_fragment(self):
+        fmt = {"url": "https://example.com/a.flv", "fragments": [{"url": "a"}, {"url": "b"}]}
+        info = {"durl": [{"url": fmt["url"], "backup_url": ["https://example.com/backup.flv"]}]}
+        self.assertEqual(bili._expand_cdn_formats(info, [fmt]), [fmt])
 
 
 class SamplingTests(unittest.IsolatedAsyncioTestCase):
@@ -484,6 +570,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         for error, expected in (
             ("ERROR: HTTP Error 567: Unknown Status", "HTTP 567"),
             ("缺少下载依赖，请在 AstrBot 环境安装 requirements.txt。", "缺少视频下载依赖"),
+            ("ERROR: HTTPSConnectionPool: Read timed out. Giving up after 0 retries", "连接超时"),
         ):
             with patch.object(plugin, "_run", AsyncMock(return_value=(1, "", error))), patch.object(
                 plugin, "_ffmpeg_path", return_value="ffmpeg"
@@ -494,18 +581,27 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_downloader_inherits_astrbot_dependency_directory(self):
         with tempfile.TemporaryDirectory(prefix="vw_dependencies_") as directory:
-            module = Path(directory) / "yt_dlp.py"
+            package = Path(directory) / "yt_dlp"
+            (package / "extractor").mkdir(parents=True)
+            (package / "utils.py").write_text("class DownloadError(Exception): pass\n", encoding="utf-8")
+            (package / "extractor" / "__init__.py").write_text("", encoding="utf-8")
+            (package / "extractor" / "bilibili.py").write_text("class BiliBiliIE: pass\n", encoding="utf-8")
+            module = package / "__init__.py"
             module.write_text(
                 "from pathlib import Path\n"
                 "class YoutubeDL:\n"
                 "    def __init__(self, options):\n"
-                "        self.path = options['outtmpl'].replace('%(ext)s', 'mp4')\n"
+                "        self.params = {'outtmpl': {'default': options['outtmpl']}}\n"
                 "    def __enter__(self): return self\n"
                 "    def __exit__(self, *args): pass\n"
-                "    def extract_info(self, url, download):\n"
-                "        Path(self.path).write_bytes(b'test video')\n"
-                "        return {'id': 'test'}\n"
-                "    def prepare_filename(self, info): return self.path\n",
+                "    def add_info_extractor(self, ie): pass\n"
+                "    def extract_info(self, url, download, process):\n"
+                "        return {'id': 'test', 'formats': [{'url': 'https://example.com/video.mp4'}]}\n"
+                "    def process_ie_result(self, info, download): return info\n"
+                "    def process_info(self, info):\n"
+                "        Path(self.prepare_filename(info)).write_bytes(b'test video')\n"
+                "    def prepare_filename(self, info):\n"
+                "        return self.params['outtmpl']['default'].replace('%(ext)s', 'mp4')\n",
                 encoding="utf-8",
             )
             seen = []

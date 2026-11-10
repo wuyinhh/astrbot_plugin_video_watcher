@@ -17,7 +17,7 @@ help: |-
 
   每秒抽 1 帧，每分钟约 60 帧；分批分析后用当前人格回复。
   不分析声音，快速动作可能发生在两帧之间；长视频耗时和模型用量会增加。
-version: 0.3.0
+version: 0.3.1
 author: 无音
 repo: https://github.com/wuyinhh/astrbot_plugin_video_watcher
 astrbot_version: ">=4.24.0"

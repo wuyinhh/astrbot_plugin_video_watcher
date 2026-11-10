@@ -4,6 +4,8 @@ import html
 import json
 import re
 import sys
+import tempfile
+from copy import deepcopy
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
@@ -91,8 +93,59 @@ def resolve_url(url: str) -> str:
     raise ValueError("B 站短链接跳转次数过多，请复制视频页地址重试。")
 
 
+def _cdn_preference(url: str) -> int:
+    """常规 CDN 优先，MCDN/PCDN 和非标准端口留作最后的备选。"""
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    return -10 if (
+        parsed.port not in {None, 80, 443}
+        or any(part in host.split(".") for part in ("mcdn", "pcdn", "szbdyd"))
+    ) else 0
+
+
+def _expand_cdn_formats(play_info: dict, formats: list[dict]) -> list[dict]:
+    """保留 B 站返回的签名备用地址，不自行替换主机名或签名参数。"""
+    backups = {}
+    streams = [*(play_info.get("dash") or {}).get("video", []),
+               *play_info.get("durl", [])]
+    for stream in streams:
+        primary = stream.get("baseUrl") or stream.get("base_url") or stream.get("url")
+        alternatives = stream.get("backupUrl") or stream.get("backup_url") or []
+        if isinstance(alternatives, str):
+            alternatives = [alternatives]
+        backups[primary] = alternatives
+    expanded = []
+    for fmt in formats:
+        # 多段 FLV 的拼接由上游处理，不能把单段备用地址当成整个视频。
+        if fmt.get("vcodec") == "none" or fmt.get("fragments"):
+            expanded.append(fmt)
+            continue
+        urls = dict.fromkeys([fmt["url"], *backups.get(fmt["url"], [])])
+        for index, url in enumerate(urls):
+            if not isinstance(url, str) or urlsplit(url).scheme not in {"http", "https"}:
+                continue
+            expanded.append({
+                **fmt, "url": url,
+                "format_id": f"{fmt.get('format_id') or 'video'}-cdn{index}",
+                "source_preference": _cdn_preference(url),
+            })
+    return expanded
+
+
+def _bilibili_extractor():
+    from yt_dlp.extractor.bilibili import BiliBiliIE as BaseBiliBiliIE
+
+    # 保持同一个 ie_key，仅替换本次下载器中的 B 站格式解析。
+    class BiliBiliIE(BaseBiliBiliIE):
+        def extract_formats(self, play_info):
+            return _expand_cdn_formats(play_info, super().extract_formats(play_info))
+
+    return BiliBiliIE()
+
+
 def download_video(url: str, directory: Path, max_mb: int) -> Path:
     from yt_dlp import YoutubeDL
+    from yt_dlp.utils import DownloadError
 
     url = resolve_url(url)
     limit = max_mb * 1024 * 1024
@@ -116,6 +169,7 @@ def download_video(url: str, directory: Path, max_mb: int) -> Path:
         "format": "bestvideo[height<=720]/best[height<=720]/worstvideo/worst",
         # 同一视频的不同编码可能走不同 CDN，跳过实际无法访问的视频流。
         "check_formats": "selected",
+        "format_sort": ["source"],
         # 部分 B 站 CDN 要求 Range 请求；分块下载只作用于视频，不影响网页/API。
         "http_chunk_size": 4 * 1024 * 1024,
         "outtmpl": str(directory / "source.%(ext)s"),
@@ -124,17 +178,46 @@ def download_video(url: str, directory: Path, max_mb: int) -> Path:
         "allowed_extractors": ["BiliBili"],
         "max_filesize": limit,
         "progress_hooks": [check_size],
-        "socket_timeout": 20,
-        "retries": 1,
+        "socket_timeout": 10,
+        "retries": 0,
         "fragment_retries": 1,
         "cachedir": False,
         "logger": QuietLogger(),
     }
     with YoutubeDL(options) as downloader:
-        info = downloader.extract_info(url, download=True)
+        downloader.add_info_extractor(_bilibili_extractor())
+        info = downloader.extract_info(url, download=False, process=False)
         if not info or info.get("_type") in {"playlist", "multi_video"}:
             raise ValueError("未取得单个视频，请使用具体视频页链接。")
-        path = Path(downloader.prepare_filename(info)).resolve()
+        failed_urls = set()
+        last_error = None
+        for attempt in range(3):
+            candidate = deepcopy(info)
+            candidate["formats"] = [
+                fmt for fmt in candidate.get("formats", [])
+                if fmt.get("url") not in failed_urls and fmt.get("vcodec") != "none"
+            ]
+            if not candidate["formats"] and last_error is not None:
+                raise last_error
+            # 每条线路单独保存，切换编码或节点时不续写上一份残缺文件。
+            with tempfile.TemporaryDirectory(prefix=f"attempt_{attempt}_", dir=directory) as attempt_folder:
+                attempt_dir = Path(attempt_folder)
+                downloader.params["outtmpl"]["default"] = str(attempt_dir / "source.%(ext)s")
+                selected = downloader.process_ie_result(candidate, download=False)
+                try:
+                    downloader.process_info(selected)
+                except DownloadError as exc:
+                    if attempt == 2:
+                        raise
+                    last_error = exc
+                    failed_urls.add(selected["url"])
+                    continue
+                downloaded = Path(downloader.prepare_filename(selected)).resolve()
+                if downloaded.parent != attempt_dir.resolve() or not downloaded.is_file():
+                    raise ValueError(f"未下载到视频，文件可能超过 {max_mb} MB 或无法访问。")
+                path = directory.resolve() / downloaded.name
+                downloaded.replace(path)
+                break
     if path.parent != directory.resolve() or not path.is_file():
         raise ValueError(f"未下载到视频，文件可能超过 {max_mb} MB 或无法访问。")
     if path.stat().st_size > limit:
