@@ -6,8 +6,10 @@ import json
 import logging
 import sys
 import tempfile
+import threading
 import types
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -143,6 +145,77 @@ class LinkTests(unittest.TestCase):
                 bili.download_video(URL, ROOT, 1)
 
 
+class DownloadRegressionTests(unittest.TestCase):
+    def test_server_requiring_range_downloads_complete_file(self):
+        try:
+            from yt_dlp import YoutubeDL
+        except ImportError:
+            self.skipTest("需要安装 yt-dlp 才能测试真实 HTTP 下载器")
+
+        payload = b"range-only-video" * 400000
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                value = self.headers.get("Range")
+                requests.append(value)
+                if not value:
+                    self.send_error(567, "Range required")
+                    return
+                start, end = value.removeprefix("bytes=").split("-", 1)
+                start = int(start)
+                end = min(int(end) if end else len(payload) - 1, len(payload) - 1)
+                if start >= len(payload):
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{len(payload)}")
+                    self.end_headers()
+                    return
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
+                self.end_headers()
+                self.wfile.write(payload[start:end + 1])
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def extract_info(downloader, url, download):
+            # 仅替换远程视频元数据解析；格式试读和正式下载均使用真实 yt-dlp。
+            # 测试仅访问本机 HTTP 服务，不使用系统代理。
+            downloader.params["proxy"] = ""
+            return downloader.process_ie_result({
+                "id": "range-test",
+                "title": "range-test",
+                "extractor": "test",
+                "webpage_url": URL,
+                "formats": [{
+                    "format_id": "test",
+                    "url": f"http://127.0.0.1:{server.server_port}/video.mp4",
+                    "ext": "mp4",
+                    "height": 360,
+                    "vcodec": "avc1",
+                    "acodec": "none",
+                }],
+            }, download=download)
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="vw_range_test_") as directory:
+                with patch.object(YoutubeDL, "extract_info", extract_info):
+                    path = bili.download_video(URL, Path(directory), 10)
+                self.assertEqual(path.read_bytes(), payload)
+                self.assertGreater(len(requests), 2)
+                self.assertTrue(all(requests))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.watcher = plugin.VideoWatcher(types.SimpleNamespace())
@@ -242,6 +315,18 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await self.watcher._describe_source(SHORT, "", None)
         self.assertFalse(seen[0].exists())
+
+    async def test_http_error_and_missing_dependency_have_distinct_messages(self):
+        for error, expected in (
+            ("ERROR: HTTP Error 567: Unknown Status", "HTTP 567"),
+            ("缺少下载依赖，请在 AstrBot 环境安装 requirements.txt。", "缺少视频下载依赖"),
+        ):
+            with patch.object(plugin, "_run", AsyncMock(return_value=(1, "", error))), patch.object(
+                plugin, "_ffmpeg_path", return_value="ffmpeg"
+            ):
+                result = await self.watcher._describe_source(URL, "", None)
+            self.assertIn(expected, result)
+            self.assertNotIn("需要登录", result)
 
     async def test_downloader_inherits_astrbot_dependency_directory(self):
         with tempfile.TemporaryDirectory(prefix="vw_dependencies_") as directory:

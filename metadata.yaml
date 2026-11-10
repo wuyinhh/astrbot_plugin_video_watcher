@@ -15,7 +15,7 @@ help: |-
   4. 正常唤醒机器人后，也可由模型按需调用 describe_video 工具
 
   注意：只能看到静止画面（约 6 帧），看不出连贯动作和声音。
-version: 0.2.0
+version: 0.2.1
 author: 无音
 repo: https://github.com/wuyinhh/astrbot_plugin_video_watcher
 astrbot_version: ">=4.24.0"

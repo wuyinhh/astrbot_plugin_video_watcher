@@ -174,9 +174,17 @@ class VideoWatcher(Star):
                     return "B 站视频下载超时，请稍后重试，或者直接发送视频文件。"
                 if code != 0:
                     logger.warning(f"[video_watcher] B 站下载失败: {err[-1000:]}")
+                    if "缺少下载依赖" in err:
+                        return "缺少视频下载依赖，请在 AstrBot 插件页重新更新视频观察员，并检查依赖安装日志。"
+                    status = re.search(r"HTTP Error (\d{3})", err)
+                    if status:
+                        return (
+                            f"B 站视频下载请求被服务器拒绝（HTTP {status[1]}）。"
+                            "请稍后重试，或直接发送视频文件。"
+                        )
                     return (
-                        "B 站视频下载失败。视频可能需要登录、已失效，或当前网络被 B 站限制。"
-                        "请确认 AstrBot 已安装最新 requirements.txt，或直接发送视频文件。"
+                        "B 站视频下载失败，详细原因已记录到 AstrBot 日志。"
+                        "请确认链接能正常打开，或直接发送视频文件。"
                     )
                 try:
                     path = Path(json.loads(out)["path"]).resolve()

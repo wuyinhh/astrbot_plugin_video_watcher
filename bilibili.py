@@ -116,6 +116,8 @@ def download_video(url: str, directory: Path, max_mb: int) -> Path:
         "format": "bestvideo[height<=720]/best[height<=720]/worstvideo/worst",
         # 同一视频的不同编码可能走不同 CDN，跳过实际无法访问的视频流。
         "check_formats": "selected",
+        # 部分 B 站 CDN 要求 Range 请求；分块下载只作用于视频，不影响网页/API。
+        "http_chunk_size": 4 * 1024 * 1024,
         "outtmpl": str(directory / "source.%(ext)s"),
         "noplaylist": True,
         "playlist_items": "1",
