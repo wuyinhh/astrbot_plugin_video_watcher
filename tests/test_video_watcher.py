@@ -55,11 +55,15 @@ SHORT = "https://b23.tv/AbC123"
 
 
 def make_event(chain=(), text=""):
+    extras = {}
     return types.SimpleNamespace(
         get_messages=lambda: chain,
         get_message_str=lambda: text,
         unified_msg_origin="test:group:123",
         plain_result=lambda value: value,
+        get_extra=lambda key, default=None: extras.get(key, default),
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+        request_llm=lambda **kwargs: types.SimpleNamespace(kind="llm_request", **kwargs),
     )
 
 
@@ -216,22 +220,151 @@ class DownloadRegressionTests(unittest.TestCase):
             thread.join(timeout=5)
 
 
+class SamplingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_ffmpeg_samples_one_frame_per_second_in_batches(self):
+        ffmpeg = plugin._ffmpeg_path()
+        if not ffmpeg:
+            self.skipTest("需要 imageio-ffmpeg 才能验证真实抽帧")
+        for seconds, expected in ((0.2, 1), (60, 60), (65.4, 66)):
+            with self.subTest(seconds=seconds), tempfile.TemporaryDirectory(prefix="vw_sampling_") as folder:
+                root = Path(folder)
+                video = root / "sample.mp4"
+                code, _, err = await plugin._run([
+                    ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10",
+                    "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast", str(video),
+                ])
+                self.assertEqual(code, 0, err)
+                all_names = []
+                for start in range(0, expected, plugin.FRAMES_PER_BATCH):
+                    with tempfile.TemporaryDirectory(dir=root) as batch:
+                        frames = await plugin._extract_frames(
+                            ffmpeg, video, Path(batch), start,
+                            min(plugin.FRAMES_PER_BATCH, expected - start),
+                        )
+                        self.assertLessEqual(len(frames), plugin.FRAMES_PER_BATCH)
+                        all_names.extend(Path(path).name for path in frames)
+                self.assertEqual(all_names, [f"f_{i:08d}.jpg" for i in range(expected)])
+
+    async def test_every_frame_is_analyzed_and_previous_batch_is_removed(self):
+        with tempfile.TemporaryDirectory(prefix="vw_analysis_") as folder:
+            video = Path(folder) / "sample.mp4"
+            video.write_bytes(b"video")
+            seen, calls = [], []
+
+            async def extract(ffmpeg, path, out_dir, start, count):
+                self.assertTrue(all(not old.exists() for old in seen))
+                frames = [out_dir / f"f_{i:08d}.jpg" for i in range(start, start + count)]
+                for frame in frames:
+                    frame.write_bytes(b"image")
+                seen.extend(frames)
+                return list(map(str, frames))
+
+            async def text_chat(prompt, image_urls):
+                self.assertTrue(all(Path(path).is_file() for path in image_urls))
+                calls.append(len(image_urls))
+                return types.SimpleNamespace(completion_text="画面观察")
+
+            provider = types.SimpleNamespace(text_chat=AsyncMock(side_effect=text_chat))
+            watcher = plugin.VideoWatcher(types.SimpleNamespace(get_using_provider=lambda umo: provider))
+            with patch.object(plugin, "_extract_frames", side_effect=extract), patch.object(
+                plugin, "_probe_duration", AsyncMock(return_value=25.3)
+            ), patch.object(plugin, "_ffmpeg_path", return_value="ffmpeg"):
+                result = await watcher._describe(str(video), "有什么变化？", "session")
+            self.assertEqual(calls, [12, 12, 2])
+            self.assertIn("26 帧", result)
+            self.assertTrue(all(not path.parent.exists() for path in seen))
+            self.assertTrue(video.is_file())
+
+    async def test_failed_or_cancelled_vision_call_removes_batch(self):
+        for failure in (RuntimeError("vision unavailable"), asyncio.CancelledError()):
+            with tempfile.TemporaryDirectory(prefix="vw_analysis_") as folder:
+                video = Path(folder) / "sample.mp4"
+                video.write_bytes(b"video")
+                seen = []
+
+                async def extract(ffmpeg, path, out_dir, start, count):
+                    frame = out_dir / "f_00000000.jpg"
+                    frame.write_bytes(b"image")
+                    seen.append(frame)
+                    return [str(frame)]
+
+                provider = types.SimpleNamespace(text_chat=AsyncMock(side_effect=failure))
+                watcher = plugin.VideoWatcher(types.SimpleNamespace(get_using_provider=lambda umo: provider))
+                with patch.object(plugin, "_extract_frames", side_effect=extract), patch.object(
+                    plugin, "_probe_duration", AsyncMock(return_value=1)
+                ), patch.object(plugin, "_ffmpeg_path", return_value="ffmpeg"):
+                    if isinstance(failure, asyncio.CancelledError):
+                        with self.assertRaises(asyncio.CancelledError):
+                            await watcher._describe(str(video), "", None)
+                    else:
+                        self.assertIn("出错", await watcher._describe(str(video), "", None))
+                self.assertFalse(seen[0].parent.parent.exists())
+
+    async def test_unknown_duration_reads_until_end_and_summaries_are_merged(self):
+        with tempfile.TemporaryDirectory(prefix="vw_analysis_") as folder:
+            video = Path(folder) / "sample.mp4"
+            video.write_bytes(b"video")
+            starts = []
+
+            async def extract(ffmpeg, path, out_dir, start, count):
+                starts.append(start)
+                paths = []
+                for i in range(min(count, 13 - start)):
+                    frame = out_dir / f"f_{start+i:08d}.jpg"
+                    frame.write_bytes(b"image")
+                    paths.append(str(frame))
+                return paths
+
+            provider = types.SimpleNamespace(text_chat=AsyncMock(side_effect=[
+                types.SimpleNamespace(completion_text="第一段观察内容"),
+                types.SimpleNamespace(completion_text="合并摘要"),
+                types.SimpleNamespace(completion_text="第二段观察内容"),
+                types.SimpleNamespace(completion_text="最终合并摘要"),
+            ]))
+            watcher = plugin.VideoWatcher(types.SimpleNamespace(get_using_provider=lambda umo: provider))
+            with patch.object(plugin, "_extract_frames", side_effect=extract), patch.object(
+                plugin, "_probe_duration", AsyncMock(return_value=0)
+            ), patch.object(plugin, "_ffmpeg_path", return_value="ffmpeg"), patch.object(
+                plugin, "SUMMARY_MERGE_CHARS", 1
+            ):
+                result = await watcher._describe(str(video), "", None)
+            self.assertEqual(starts, [0, 12])
+            self.assertIn("13 帧", result)
+            self.assertIn("最终合并摘要", result)
+            self.assertNotIn("image_urls", provider.text_chat.call_args_list[1].kwargs)
+
+
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.watcher = plugin.VideoWatcher(types.SimpleNamespace())
+        self.conversation = types.SimpleNamespace(
+            cid="current", persona_id="dafeyu", history='[{"role":"user","content":"之前的聊天"}]'
+        )
+        self.manager = types.SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="current"),
+            get_conversation=AsyncMock(return_value=self.conversation),
+            new_conversation=AsyncMock(return_value="new"),
+        )
+        self.watcher = plugin.VideoWatcher(types.SimpleNamespace(conversation_manager=self.manager))
 
     async def test_command_handles_reply_card(self):
         event = make_event([comp.Reply(chain=[comp.Json(data={"url": SHORT})],
                                       message_str="", text="")], "/看视频")
         self.watcher._describe_source = AsyncMock(return_value="画面描述")
         results = [result async for result in self.watcher.watch_video_cmd(event)]
-        self.assertEqual(results, ["画面描述"])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].kind, "llm_request")
+        self.assertIs(results[0].conversation, self.conversation)
+        self.assertIn("画面描述", results[0].prompt)
+        self.assertFalse(hasattr(results[0], "contexts"))
         self.watcher._describe_source.assert_awaited_once_with(SHORT, "", event.unified_msg_origin)
 
     async def test_command_with_direct_link(self):
         self.watcher._describe_source = AsyncMock(return_value="描述")
         result = [r async for r in self.watcher.watch_video_cmd(make_event(text="/看视频 " + URL))]
-        self.assertEqual(result, ["描述"])
+        self.assertEqual(result[0].kind, "llm_request")
+        self.assertIs(result[0].conversation, self.conversation)
+        self.assertIn("描述", result[0].prompt)
         self.watcher._describe_source.assert_awaited_once_with(URL, "", "test:group:123")
 
     async def test_command_with_quoted_video(self):
@@ -240,8 +373,39 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         result = [r async for r in self.watcher.watch_video_cmd(make_event([
             comp.Reply(chain=[video], message_str="", text=""),
         ]))]
-        self.assertEqual(result, ["描述"])
+        self.assertEqual(result[0].kind, "llm_request")
+        self.assertIs(result[0].conversation, self.conversation)
         self.watcher._describe.assert_awaited_once_with("/tmp/clip.mp4", "", "test:group:123")
+
+    async def test_command_creates_conversation_when_none_exists(self):
+        self.manager.get_curr_conversation_id.return_value = None
+        self.watcher._describe_source = AsyncMock(return_value="观察资料")
+        result = [r async for r in self.watcher.watch_video_cmd(make_event(text="/看视频 " + URL))]
+        self.manager.new_conversation.assert_awaited_once_with("test:group:123")
+        self.manager.get_conversation.assert_awaited_once_with("test:group:123", "new")
+        self.assertIs(result[0].conversation, self.conversation)
+
+    async def test_completed_command_does_not_inject_another_watch_tool_hint(self):
+        event = make_event(text="/看视频 " + URL)
+        self.watcher._describe_source = AsyncMock(return_value="已分析")
+        result = [r async for r in self.watcher.watch_video_cmd(event)]
+        prompt = result[0].prompt
+        await self.watcher.expose_video_links(event, result[0])
+        self.assertEqual(result[0].prompt, prompt)
+
+    async def test_failed_download_is_also_reported_through_current_persona(self):
+        self.watcher._describe_source = AsyncMock(return_value="下载失败（HTTP 567）")
+        result = [r async for r in self.watcher.watch_video_cmd(make_event(text="/看视频 " + URL))]
+        self.assertEqual(result[0].kind, "llm_request")
+        self.assertIn("HTTP 567", result[0].prompt)
+        self.assertIn("不能假装看过", result[0].prompt)
+
+    async def test_unavailable_conversation_does_not_send_raw_observations(self):
+        self.manager.get_conversation.side_effect = RuntimeError("conversation unavailable")
+        self.watcher._describe_source = AsyncMock(return_value="原始分析报告")
+        result = [r async for r in self.watcher.watch_video_cmd(make_event(text="/看视频 " + URL))]
+        self.assertNotIn("原始分析报告", result[0])
+        self.assertIn("未能接入当前对话", result[0])
 
     async def test_llm_can_see_card_url_without_downloading(self):
         event = make_event([comp.Json(data={"url": SHORT})])
