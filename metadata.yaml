@@ -1,18 +1,21 @@
 name: astrbot_plugin_video_watcher
 display_name: 视频观察员
-short_desc: 让 AI 能「看」视频：抽帧后交给视觉模型描述画面
+short_desc: 让 AI 能「看」视频：支持视频文件、B站链接和QQ分享卡片
 desc: >-
   默认情况下，AstrBot 收到视频只会把文件路径告诉模型，模型本身看不到画面。
   本插件用 ffmpeg 均匀抽取若干帧，再把帧图交给当前对话模型描述内容，
   从而让机器人能够「看懂」视频里的大致场景、人物、动作和画面文字。
+  支持下载 B 站普通视频链接、b23.tv 短链接及 QQ 分享卡片中的视频，
+  也支持引用其他人发送的视频或分享消息。
 help: |-
   用法：
   1. 发送视频时同时发 /看视频
-  2. 或引用一条视频消息，再发 /看视频
-  3. 也可以什么都不做，由模型在需要时自行调用 describe_video 工具
+  2. 发送 /看视频 B站链接（支持 b23.tv 短链接）
+  3. 或引用一条视频、B站链接/分享卡片消息，再发 /看视频
+  4. 正常唤醒机器人后，也可由模型按需调用 describe_video 工具
 
   注意：只能看到静止画面（约 6 帧），看不出连贯动作和声音。
-version: 0.1.0
+version: 0.2.0
 author: 无音
 repo: https://github.com/wuyinhh/astrbot_plugin_video_watcher
 astrbot_version: ">=4.24.0"
@@ -20,3 +23,4 @@ tags:
   - 视频
   - 视觉
   - 多模态
+  - B站

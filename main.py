@@ -1,19 +1,63 @@
 import asyncio
+import json
+import os
 import re
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Video
+from astrbot.api.message_components import Json, Plain, Reply, Share, Video
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+
+from .bilibili import find_urls
 
 # ---- 可调参数 ----
 MAX_FRAMES = 6          # 抽几帧
 FRAME_WIDTH = 640       # 帧图宽度（越大越清晰，也越费 token）
 MAX_VIDEO_MB = 500      # 超过这个大小直接拒绝
 FFMPEG_TIMEOUT = 180    # 单次 ffmpeg 超时（秒）
+DOWNLOAD_TIMEOUT = 180  # 链接解析及下载总超时（秒）
+
+
+def _message_links(event: AstrMessageEvent) -> list[str]:
+    # 本条消息中的地址优先于引用消息；QQ 卡片不会出现在纯文本里。
+    links = find_urls(event.get_message_str())
+
+    def visit(chain, depth=0):
+        if depth > 8:
+            return
+        for comp in chain:
+            if isinstance(comp, Plain):
+                links.extend(find_urls(comp.text))
+            elif isinstance(comp, Json):
+                links.extend(find_urls(comp.data))
+            elif isinstance(comp, Share):
+                links.extend(find_urls(comp.url))
+        for comp in chain:
+            if isinstance(comp, Reply):
+                links.extend(find_urls(comp.message_str or comp.text))
+                visit(comp.chain or [], depth + 1)
+
+    visit(event.get_messages())
+    return list(dict.fromkeys(links))
+
+
+def _find_video(chain, depth=0):
+    if depth > 8:
+        return None
+    for comp in chain:
+        if isinstance(comp, Video):
+            return comp
+    for comp in chain:
+        if isinstance(comp, Reply):
+            video = _find_video(comp.chain or [], depth + 1)
+            if video:
+                return video
+    return None
 
 
 def _ffmpeg_path() -> str | None:
@@ -29,17 +73,27 @@ def _ffmpeg_path() -> str | None:
     return shutil.which("ffmpeg")
 
 
-async def _run(cmd: list[str], timeout: int = 120) -> tuple[int, str, str]:
+async def _run(
+    cmd: list[str], timeout: int = 120, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        if proc.returncode is None:
+            proc.kill()
+        await proc.communicate()
         return -1, "", "timeout"
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.communicate()
+        raise
     return (
         proc.returncode or 0,
         out.decode("utf-8", errors="ignore"),
@@ -91,6 +145,60 @@ class VideoWatcher(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
+        self._download_slots = asyncio.Semaphore(2)
+
+    async def _describe_source(self, source: str, question: str, umo: str | None) -> str:
+        source = (source or "").strip().strip('"').strip("'")
+        urls = find_urls(source)
+        if not urls:
+            if source.lower().startswith(("http://", "https://")):
+                return "目前支持 B 站普通视频链接、b23.tv 短链接或直接发送的视频文件。"
+            return await self._describe(source, question, umo)
+        if not _ffmpeg_path():
+            return "找不到 ffmpeg。请先在 AstrBot 环境安装 requirements.txt。"
+        async with self._download_slots:
+            # 子进程结束后再删目录，超时/取消时不会留下继续下载的后台线程。
+            with tempfile.TemporaryDirectory(prefix="vw_bili_") as directory:
+                # AstrBot 可能将插件依赖加到 sys.path，而非安装到 Python 默认目录。
+                download_env = os.environ.copy()
+                download_env["PYTHONPATH"] = os.pathsep.join(
+                    str(Path(path).resolve()) for path in sys.path if path
+                )
+                code, out, err = await _run(
+                    [sys.executable, "-X", "utf8", str(Path(__file__).with_name("bilibili.py")),
+                     urls[0], directory, str(MAX_VIDEO_MB)],
+                    timeout=DOWNLOAD_TIMEOUT,
+                    env=download_env,
+                )
+                if code == -1:
+                    return "B 站视频下载超时，请稍后重试，或者直接发送视频文件。"
+                if code != 0:
+                    logger.warning(f"[video_watcher] B 站下载失败: {err[-1000:]}")
+                    return (
+                        "B 站视频下载失败。视频可能需要登录、已失效，或当前网络被 B 站限制。"
+                        "请确认 AstrBot 已安装最新 requirements.txt，或直接发送视频文件。"
+                    )
+                try:
+                    path = Path(json.loads(out)["path"]).resolve()
+                    if path.parent != Path(directory).resolve() or not path.is_file():
+                        raise ValueError("下载文件路径无效")
+                except (ValueError, KeyError, TypeError):
+                    return "B 站视频下载结果无效，请稍后重试。"
+                return await self._describe(str(path), question, umo)
+
+    @filter.on_llm_request()
+    async def expose_video_links(self, event: AstrMessageEvent, req: ProviderRequest):
+        """让模型也能看到 QQ 分享卡片及引用消息中的实际视频地址。"""
+        links = _message_links(event)
+        if links:
+            note = (
+                "[视频观察员：本条消息或引用消息包含 B 站视频链接]\n"
+                + "\n".join(links[:5])
+                + "\n需要了解视频画面时，可调用 describe_video，path 填上面的链接。"
+                "工具返回前不要声称已经看过视频。"
+            )
+            if note not in (req.prompt or ""):
+                req.prompt = (req.prompt or "") + "\n\n" + note
 
     async def _describe(self, video_path: str, question: str, umo: str | None) -> str:
         raw = (video_path or "").strip().strip('"').strip("'")
@@ -134,35 +242,45 @@ class VideoWatcher(Star):
 
     @filter.command("看视频")
     async def watch_video_cmd(self, event: AstrMessageEvent):
-        """看视频：附带或引用一个视频，让 AI 描述画面。"""
-        video = None
-        for comp in event.get_messages():
-            if isinstance(comp, Video):
-                video = comp
-                break
+        """看视频：发送或引用视频、B 站链接或分享卡片。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        links = _message_links(event)
+        if links:
+            yield event.plain_result(await self._describe_source(links[0], "", umo))
+            return
+        video = _find_video(event.get_messages())
         if video is None:
-            yield event.plain_result("把视频和 /看视频 一起发，或者引用一条视频再发 /看视频。")
+            yield event.plain_result(
+                "发送 /看视频 B站链接，或引用别人发的视频、B站链接/分享卡片后发送 /看视频。"
+            )
             return
         try:
             path = await video.convert_to_file_path()
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"拿不到视频文件：{exc}")
             return
-        umo = getattr(event, "unified_msg_origin", None)
         yield event.plain_result(await self._describe(path, "", umo))
 
     @llm_tool(name="describe_video")
     async def describe_video(
         self,
         event: AstrMessageEvent,
-        path: str,
+        path: str = "",
         question: str = "",
     ) -> str:
-        """查看一个本地视频文件的画面内容（抽帧后交给视觉模型描述）。
+        """查看视频画面，支持 B 站链接、b23.tv 短链接和本地视频文件。
+
+        用户发来或引用 B 站视频/分享卡片，并想知道画面内容时使用。
+        自动下载视频并抽帧，不能听声音；不要仅凭卡片标题推测视频内容。
 
         Args:
-            path(string): 视频文件的绝对路径，通常来自消息里的 [Video Attachment: name ... path ...]。
+            path(string): B站视频链接、b23.tv短链接或本地视频绝对路径；留空则从本条消息或引用的分享卡片中提取链接。
             question(string): 想从画面里确认的具体问题，留空则做整体描述。
         """
         umo = getattr(event, "unified_msg_origin", None)
-        return await self._describe(path, question, umo)
+        if not path.strip():
+            links = _message_links(event)
+            if not links:
+                return "本条消息及引用消息中没有找到 B 站链接，请提供视频链接或本地视频路径。"
+            path = links[0]
+        return await self._describe_source(path, question, umo)
